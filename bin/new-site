@@ -1,0 +1,190 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Stands up one more Discourse site on a host that runs Caddy and
+# discourse_docker: a shared data container (Postgres and Redis, made
+# once), a web_only container for the site on a localhost port, a Caddy
+# site block, and optionally a restore of a backup file. Prints the plan;
+# --apply does it.
+#
+#   bin/new-site --hostname forum.example.com --port 8081 \
+#     --smtp-address smtp.example.com --smtp-user u --smtp-password p \
+#     --developer-email you@example.com \
+#     --plugin https://github.com/discourse/discourse-solved.git \
+#     --backup ~/forum-2026-09-28.tar.gz --apply
+#
+# Assumes /var/discourse (--docker-dir) and a Caddyfile that imports
+# sites/*.caddy (--caddy-dir). Run as a user who may run docker.
+
+require "optparse"
+require "yaml"
+require "fileutils"
+require "shellwords"
+
+module NewSite
+  DEFAULTS = {
+    docker_dir: "/var/discourse",
+    caddy_dir: "/etc/caddy/sites",
+    data_name: "data",
+    port: 8081,
+    plugins: [],
+    version: "stable",
+    unicorn_workers: 2,
+    db_shared_buffers: "256MB",
+    developer_email: nil,
+    smtp_address: nil,
+    smtp_port: 587,
+    smtp_user: nil,
+    smtp_password: nil,
+    backup: nil,
+    apply: false,
+  }.freeze
+
+  def self.parse(argv)
+    options = DEFAULTS.dup
+    options[:plugins] = []
+    parser =
+      OptionParser.new do |o|
+        o.banner = "Usage: new-site --hostname HOST [options]"
+        o.on("--hostname HOST", "Public hostname of the site (required)") { |v| options[:hostname] = v }
+        o.on("--name NAME", "Container name (default: first label of the hostname)") { |v| options[:name] = v }
+        o.on("--port PORT", Integer, "Localhost port Caddy proxies to (default 8081)") { |v| options[:port] = v }
+        o.on("--docker-dir DIR", "discourse_docker checkout (default /var/discourse)") { |v| options[:docker_dir] = v }
+        o.on("--caddy-dir DIR", "Directory the Caddyfile imports (default /etc/caddy/sites)") { |v| options[:caddy_dir] = v }
+        o.on("--data-name NAME", "Shared data container name (default data)") { |v| options[:data_name] = v }
+        o.on("--plugin URL", "Plugin git url to clone in (repeatable)") { |v| options[:plugins] << v }
+        o.on("--version BRANCH", "Discourse branch or tag (default stable)") { |v| options[:version] = v }
+        o.on("--developer-email EMAIL", "First admin's email") { |v| options[:developer_email] = v }
+        o.on("--smtp-address HOST") { |v| options[:smtp_address] = v }
+        o.on("--smtp-port PORT", Integer) { |v| options[:smtp_port] = v }
+        o.on("--smtp-user USER") { |v| options[:smtp_user] = v }
+        o.on("--smtp-password PASS") { |v| options[:smtp_password] = v }
+        o.on("--unicorn-workers N", Integer, "Default 2") { |v| options[:unicorn_workers] = v }
+        o.on("--db-shared-buffers SIZE", "Postgres shared buffers for the data container (default 256MB)") { |v| options[:db_shared_buffers] = v }
+        o.on("--backup FILE", "A Discourse backup .tar.gz to restore after bootstrap") { |v| options[:backup] = v }
+        o.on("--apply", "Do it (default: print the plan)") { options[:apply] = true }
+      end
+    parser.parse!(argv)
+    raise OptionParser::MissingArgument, "--hostname" if options[:hostname].to_s.empty?
+    options[:name] ||= options[:hostname].split(".").first
+    options
+  end
+
+  # Postgres and Redis for every site on the host, made once.
+  def self.data_yml(o)
+    {
+      "templates" => %w[templates/postgres.template.yml templates/redis.template.yml],
+      "params" => {
+        "db_default_text_search_config" => "pg_catalog.english",
+        "db_shared_buffers" => o[:db_shared_buffers],
+      },
+      "env" => { "LANG" => "en_US.UTF-8" },
+      "volumes" => [
+        { "volume" => { "host" => "#{o[:docker_dir]}/shared/#{o[:data_name]}", "guest" => "/shared" } },
+        { "volume" => { "host" => "#{o[:docker_dir]}/shared/#{o[:data_name]}/log/var-log", "guest" => "/var/log" } },
+      ],
+    }
+  end
+
+  # The site: web only, talking to the data container over the docker
+  # link, listening on a localhost port for Caddy. Caddy owns TLS, so no
+  # Let's Encrypt template here, and force_https so links come out right
+  # behind the proxy.
+  def self.web_yml(o, redis_db:)
+    clones = ["git clone https://github.com/discourse/docker_manager.git"] + o[:plugins].map { |url| "git clone #{url}" }
+    {
+      "templates" => %w[templates/web.template.yml templates/web.ratelimited.template.yml],
+      "expose" => ["127.0.0.1:#{o[:port]}:80"],
+      "params" => { "version" => o[:version] },
+      "env" => {
+        "LANG" => "en_US.UTF-8",
+        "DISCOURSE_DEFAULT_LOCALE" => "en",
+        "UNICORN_WORKERS" => o[:unicorn_workers],
+        "DISCOURSE_HOSTNAME" => o[:hostname],
+        "DISCOURSE_FORCE_HTTPS" => true,
+        "DISCOURSE_DB_HOST" => o[:data_name],
+        "DISCOURSE_DB_NAME" => "discourse_#{o[:name].tr("-", "_")}",
+        "DISCOURSE_REDIS_HOST" => o[:data_name],
+        "DISCOURSE_REDIS_DB" => redis_db,
+        "DISCOURSE_SMTP_ADDRESS" => o[:smtp_address] || "CHANGE_ME",
+        "DISCOURSE_SMTP_PORT" => o[:smtp_port],
+        "DISCOURSE_SMTP_USER_NAME" => o[:smtp_user] || "CHANGE_ME",
+        "DISCOURSE_SMTP_PASSWORD" => o[:smtp_password] || "CHANGE_ME",
+        "DISCOURSE_DEVELOPER_EMAILS" => o[:developer_email] || "CHANGE_ME",
+      },
+      "volumes" => [
+        { "volume" => { "host" => "#{o[:docker_dir]}/shared/#{o[:name]}", "guest" => "/shared" } },
+        { "volume" => { "host" => "#{o[:docker_dir]}/shared/#{o[:name]}/log/var-log", "guest" => "/var/log" } },
+      ],
+      "links" => [{ "link" => { "name" => o[:data_name], "alias" => o[:data_name] } }],
+      "hooks" => { "after_code" => [{ "exec" => { "cd" => "$home/plugins", "cmd" => clones } }] },
+    }
+  end
+
+  def self.caddy_block(o)
+    <<~CADDY
+      #{o[:hostname]} {
+          encode gzip
+          reverse_proxy 127.0.0.1:#{o[:port]}
+      }
+    CADDY
+  end
+
+  # Every site needs its own database number on the shared Redis; the next
+  # free one is one more than the highest any container file uses.
+  def self.next_redis_db(docker_dir)
+    used =
+      Dir[File.join(docker_dir, "containers", "*.yml")].filter_map do |path|
+        (YAML.safe_load(File.read(path)) || {}).dig("env", "DISCOURSE_REDIS_DB")
+      end
+    (used.map(&:to_i).max || -1) + 1
+  end
+
+  # The steps, as [:write, path, content] and [:run, command].
+  def self.plan(o)
+    steps = []
+    data_path = File.join(o[:docker_dir], "containers", "#{o[:data_name]}.yml")
+    web_path = File.join(o[:docker_dir], "containers", "#{o[:name]}.yml")
+    caddy_path = File.join(o[:caddy_dir], "#{o[:name]}.caddy")
+    launcher = "cd #{Shellwords.escape(o[:docker_dir])} && ./launcher"
+
+    if !File.exist?(data_path)
+      steps << [:write, data_path, data_yml(o).to_yaml]
+      steps << [:run, "#{launcher} bootstrap #{o[:data_name]} && #{launcher} start #{o[:data_name]}"]
+    end
+    steps << [:write, web_path, web_yml(o, redis_db: next_redis_db(o[:docker_dir])).to_yaml]
+    steps << [:run, "#{launcher} bootstrap #{o[:name]} && #{launcher} start #{o[:name]}"]
+    steps << [:write, caddy_path, caddy_block(o)]
+    steps << [:run, "systemctl reload caddy"]
+    if o[:backup]
+      dest = "#{o[:docker_dir]}/shared/#{o[:name]}/backups/default/"
+      steps << [:run, "mkdir -p #{dest} && cp #{Shellwords.escape(o[:backup])} #{dest}"]
+      restore = "discourse enable_restore && discourse restore #{File.basename(o[:backup])}"
+      steps << [:run, "#{launcher} run #{o[:name]} #{Shellwords.escape(restore)}"]
+    end
+    steps
+  end
+
+  def self.execute(steps, apply:, out: $stdout)
+    steps.each do |kind, target, content|
+      case kind
+      when :write
+        out.puts "==> write #{target}"
+        out.puts content.gsub(/^/, "    ")
+        if apply
+          FileUtils.mkdir_p(File.dirname(target))
+          File.write(target, content)
+        end
+      when :run
+        out.puts "==> run   #{target}"
+        system(target, exception: true) if apply
+      end
+    end
+    out.puts(apply ? "Done." : "Dry run; add --apply to do it.")
+  end
+end
+
+if $PROGRAM_NAME == __FILE__
+  options = NewSite.parse(ARGV)
+  NewSite.execute(NewSite.plan(options), apply: options[:apply])
+end
