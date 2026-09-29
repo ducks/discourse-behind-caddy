@@ -146,21 +146,21 @@ module NewSite
     data_path = File.join(o[:docker_dir], "containers", "#{o[:data_name]}.yml")
     web_path = File.join(o[:docker_dir], "containers", "#{o[:name]}.yml")
     caddy_path = File.join(o[:caddy_dir], "#{o[:name]}.caddy")
-    launcher = "cd #{Shellwords.escape(o[:docker_dir])} && ./launcher"
+    at = "cd #{Shellwords.escape(o[:docker_dir])} &&"
 
     if !File.exist?(data_path)
       steps << [:write, data_path, data_yml(o).to_yaml]
-      steps << [:run, "#{launcher} bootstrap #{o[:data_name]} && #{launcher} start #{o[:data_name]}"]
+      steps << [:run, "#{at} ./launcher bootstrap #{o[:data_name]} && ./launcher start #{o[:data_name]}"]
     end
     steps << [:write, web_path, web_yml(o, redis_db: next_redis_db(o[:docker_dir])).to_yaml]
-    steps << [:run, "#{launcher} bootstrap #{o[:name]} && #{launcher} start #{o[:name]}"]
+    steps << [:run, "#{at} ./launcher bootstrap #{o[:name]} && ./launcher start #{o[:name]}"]
     steps << [:write, caddy_path, caddy_block(o)]
     steps << [:run, "systemctl reload caddy"]
     if o[:backup]
       dest = "#{o[:docker_dir]}/shared/#{o[:name]}/backups/default/"
       steps << [:run, "mkdir -p #{dest} && cp #{Shellwords.escape(o[:backup])} #{dest}"]
       restore = "discourse enable_restore && discourse restore #{File.basename(o[:backup])}"
-      steps << [:run, "#{launcher} run #{o[:name]} #{Shellwords.escape(restore)}"]
+      steps << [:run, "#{at} ./launcher run #{o[:name]} '#{restore}'"]
     end
     steps
   end
